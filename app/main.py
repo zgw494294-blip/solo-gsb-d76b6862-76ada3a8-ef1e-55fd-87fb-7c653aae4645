@@ -21,6 +21,24 @@
   保持失效。副本身份高于调用方给出的已用身份上界（与拆分共用同一上界，被删除或
   合并移除的身份不复用，已有失效引用不会因此复活），接口返回更新后的上界。
 
+误合并撤销（``POST /api/merge/undo``）：
+- 撤销记录由调用方（页面内存）在每次合并成功时建立，仅存本页：含合并双方身份、
+  两条合并前原文（``keep_before`` / ``drop_before``）、保留条款合并后正文（``keep_after``）
+  及**其余全部改写引用来源**（合并前正文含 ``[[drop_id]]`` 标记的条款）各自的前后内部正文；
+  换稿（重新导入）或成功恢复存档即清空，不进存档快照。页面列出每次成功合并的记录，
+  可选择任一未撤销项；成功撤销后该记录不可再用，失败保留记录。
+- 接口入参为当前稿、撤销记录与锁定集合。记录结构损坏（身份形态、重复来源、来源即
+  合并双方、正文形态损坏、记录的合并后正文与由原文按合并规则推出的不一致等）返回 422；
+  撤销后超过 40 条同样 422。
+- 记录与当前稿对得上才执行：保留条款与全部改写来源仍存在且正文逐字等于合并后值、
+  被移除身份仍不存在；否则整次拒绝（409）并列冲突（按当前顺序，已消失身份附后），
+  当前稿与记录均不变。
+- 撤销时恢复两条原文（保留条款取回 ``keep_before``、被移除身份以 ``drop_before`` 重新
+  插在保留条款之后），各改写来源取回各自合并前正文（``drop_id`` 标记随之还原）；
+  其他正文与相对顺序不变；原稿基线不变，身份上界不回退。
+- 当前锁定集合按撤销后的实际结果核验（与保存 / 删除 / 合并 / 拆分同一机制）：
+  违例整次拒绝（409）。无重做；合并与存档协议本身不变。
+
 原稿对照（``POST /api/diff``）：
 - 入参为两份沿用现有草稿结构的文档：成功导入后不可变的原稿基线（baseline）与
   当前已保存草稿（current）；接口只返回对照结果，不回退、不修改任何一份草稿。
@@ -153,6 +171,32 @@ class MergeIn(BaseModel):
     clauses: list[ClauseIn]
     keep_id: str  # 合并后沿用的身份（当前显示顺序中较前的一条）
     drop_id: str  # 被并入并移除的一条（当前显示顺序中较后的一条）
+    lock_ids: list[str] | None = None
+
+
+class MergeUndoRewriteIn(BaseModel):
+    # 一条"合并改写引用来源"的前后内部正文：合并前其正文含 [[drop_id]] 标记
+    # （两条合并原文自身的前后正文在记录顶层单列，不出现在这里）
+    id: str
+    before: str
+    after: str
+
+
+class MergeUndoRecordIn(BaseModel):
+    # 一次成功合并的撤销记录（仅存调用方内存）：合并双方身份、两条合并前原文、
+    # 保留条款合并后正文，以及其余全部改写引用来源的前后内部正文
+    keep_id: str
+    drop_id: str
+    keep_before: str
+    drop_before: str
+    keep_after: str
+    rewrites: list[MergeUndoRewriteIn] = []
+
+
+class MergeUndoIn(BaseModel):
+    order_ids: list[str]
+    clauses: list[ClauseIn]
+    record: MergeUndoRecordIn
     lock_ids: list[str] | None = None
 
 
@@ -622,6 +666,156 @@ def merge_clauses(payload: MergeIn):
             _raise_lock_violations(violations)
 
     return {"order_ids": new_order, "clauses": merged}
+
+
+def _validate_internal_body(body: str, where: str) -> list[str]:
+    """校验单条内部正文：非空、单行、引用形态为合法内部 id 且无游离括号。"""
+    errors: list[str] = []
+    if body.strip() == "":
+        errors.append(f"{where}正文为空")
+    if "\n" in body:
+        errors.append(f"{where}不是单行条款")
+    for m in MARKER_RE.finditer(body):
+        if not ID_RE.match(m.group(1)):
+            errors.append(f"{where}内部引用形态损坏：{m.group(0)}")
+    if _stray_opens(body) or _stray_closes(body):
+        errors.append(f"{where}存在未闭合标记")
+    return errors
+
+
+@app.post("/api/merge/undo")
+def merge_undo(payload: MergeUndoIn):
+    """把一次误合并撤回到当前草稿。
+
+    记录由调用方在合并成功时建立、仅存本页；接口无状态。流程：
+
+    1. 校验当前稿、锁定集合形态与**记录结构**（身份形态、来源不重复、来源不是合并双方、
+       正文形态合法、记录的合并后正文与由两条原文按合并规则推出的一致）；撤销后超过 40 条
+       同样在此拒绝。记录损坏一律 422——记录不该被撤销操作"用掉"，留给调用方丢弃或继续展示。
+    2. 记录与当前稿核对：保留条款与全部改写来源仍存在且正文等于各自合并后值、被移除身份
+       仍不存在；任一不符整次拒绝（409）并列冲突。
+    3. 恢复两条原文与各改写来源正文（其他正文与相对顺序不变；基线与上界由调用方持有，
+       接口不回退），再按**当前锁定集合 + 撤销后的实际结果**做锁定核验，违例 409。
+    """
+    by_id = _validate_state(payload.order_ids, payload.clauses)
+    lock_ids = _normalize_lock_ids(payload.lock_ids, by_id)
+    rec = payload.record
+
+    errors: list[str] = []
+    for name, cid in (("保留身份", rec.keep_id), ("被移除身份", rec.drop_id)):
+        if not ID_RE.match(cid):
+            errors.append(f"撤销记录{name}非法：{cid}")
+    if rec.keep_id == rec.drop_id and ID_RE.match(rec.keep_id):
+        errors.append("撤销记录的保留身份与被移除身份相同")
+    if ID_RE.match(rec.keep_id) and ID_RE.match(rec.drop_id):
+        # 合并方向（较前保留）无法凭记录核对，但两条原文的合并后正文必须自洽：
+        # keep_after 应为 keep_before；drop_before 后全表 [[drop]]→[[keep]]
+        expected_keep_after = MARKER_RE.sub(
+            lambda m: f"[[{rec.keep_id if m.group(1) == rec.drop_id else m.group(1)}]]",
+            f"{rec.keep_before}；{rec.drop_before}",
+        )
+        if rec.keep_after != expected_keep_after:
+            errors.append(
+                "撤销记录的合并后正文与两条原文不一致（记录可能已损坏，无法据此撤销）"
+            )
+    errors += _validate_internal_body(rec.keep_before, "撤销记录的保留条款合并前")
+    errors += _validate_internal_body(rec.drop_before, "撤销记录的被移除条款原文")
+    errors += _validate_internal_body(rec.keep_after, "撤销记录的保留条款合并后")
+
+    rewrite_seen: set[str] = set()
+    for rw in rec.rewrites:
+        if not ID_RE.match(rw.id):
+            errors.append(f"撤销记录的改写来源身份非法：{rw.id}")
+            continue
+        if rw.id in (rec.keep_id, rec.drop_id):
+            errors.append(f"撤销记录的改写来源 {rw.id} 不能是合并双方身份（两条原文在记录顶层单列）")
+        if rw.id in rewrite_seen:
+            errors.append(f"撤销记录的改写来源重复：{rw.id}")
+        rewrite_seen.add(rw.id)
+        errors += _validate_internal_body(rw.before, f"撤销记录的改写来源 {rw.id} 合并前")
+        errors += _validate_internal_body(rw.after, f"撤销记录的改写来源 {rw.id} 合并后")
+        if ID_RE.match(rec.keep_id) and ID_RE.match(rec.drop_id) and f"[[{rec.drop_id}]]" not in rw.before:
+            errors.append(
+                f"撤销记录的改写来源 {rw.id} 合并前正文不含 [[{rec.drop_id}]] 标记，"
+                "不属于该次合并的改写来源（记录可能已损坏）"
+            )
+        if ID_RE.match(rec.keep_id) and ID_RE.match(rec.drop_id):
+            # after 必须恰是 before 上全表 [[drop]]→[[keep]] 的结果（记录与实际合并一致）
+            expected_after = MARKER_RE.sub(
+                lambda m: f"[[{rec.keep_id if m.group(1) == rec.drop_id else m.group(1)}]]",
+                rw.before,
+            )
+            if rw.after != expected_after:
+                errors.append(f"撤销记录的改写来源 {rw.id} 前后正文与合并改写规则不一致（记录可能已损坏）")
+    if errors:
+        raise HTTPException(422, detail={"errors": errors})
+
+    # 撤销后条数：当前稿少 drop_id（合并移除），撤销把它恢复，故恰为当前条数 + 1
+    if len(payload.order_ids) + 1 > MAX_LINES:
+        raise HTTPException(
+            422,
+            detail={
+                "errors": [
+                    f"撤销后共 {len(payload.order_ids) + 1} 条，超过上限 {MAX_LINES} 条，不能撤销"
+                ]
+            },
+        )
+
+    # 记录与当前稿核对：保留条款及改写来源仍存在且正文等于合并后值，被移除身份仍不存在
+    conflicts: list[dict] = []
+
+    def conflict(cid: str, kind: str, detail: str) -> None:
+        conflicts.append({"id": cid, "original": int(cid[1:]), "kind": kind, "detail": detail})
+
+    if rec.keep_id not in by_id:
+        conflict(rec.keep_id, "keep_missing", "保留条款已不在当前草稿中，无法据此撤销")
+    elif by_id[rec.keep_id].body != rec.keep_after:
+        conflict(rec.keep_id, "keep_body_changed", "保留条款的当前正文与记录的合并后正文不一致")
+    if rec.drop_id in by_id:
+        conflict(rec.drop_id, "drop_exists", "被移除身份当前已存在，撤销会与之冲突")
+    for rw in rec.rewrites:
+        cur = by_id.get(rw.id)
+        if cur is None:
+            conflict(rw.id, "source_missing", "改写引用来源条款已不在当前草稿中")
+        elif cur.body != rw.after:
+            conflict(rw.id, "source_body_changed", "改写引用来源的当前正文与记录的合并后正文不一致")
+
+    if conflicts:
+        ordered = _order_conflicts(payload.order_ids, conflicts)
+        msgs = ["合并撤销记录与当前草稿冲突，整次拒绝（当前稿未改动）："]
+        msgs.extend(f"身份 {c['id']}（原第 {c['original']} 条）：{c['detail']}" for c in ordered)
+        raise HTTPException(409, detail={"errors": msgs, "conflicts": ordered})
+
+    # 构造撤销结果：恢复两条原文（drop 插在 keep 之后），改写来源取回合并前正文，
+    # 其余正文与相对顺序不变
+    restore_map = {rw.id: rw.before for rw in rec.rewrites}
+    result_clauses: list[dict] = []
+    new_order: list[str] = []
+    for clause in payload.clauses:
+        if clause.id == rec.keep_id:
+            result_clauses.append({"id": rec.keep_id, "body": rec.keep_before})
+            result_clauses.append({"id": rec.drop_id, "body": rec.drop_before})
+            new_order.append(rec.keep_id)
+            new_order.append(rec.drop_id)
+        else:
+            body = restore_map.get(clause.id, clause.body)
+            result_clauses.append({"id": clause.id, "body": body})
+            new_order.append(clause.id)
+
+    # 锁定核验按撤销后的实际结果（与保存 / 删除 / 合并 / 拆分同一机制）
+    if lock_ids is not None:
+        new_by = {item["id"]: ClauseIn(**item) for item in result_clauses}
+        violations = _lock_violations(by_id, new_order, new_by, lock_ids)
+        if violations:
+            _raise_lock_violations(violations)
+
+    return {"order_ids": new_order, "clauses": result_clauses}
+
+
+def _order_conflicts(cur_order: list[str], conflicts: list[dict]) -> list[dict]:
+    """冲突按当前草稿顺序排列；已不在草稿中的身份（含 drop_exists 之外的消失项）排最后。"""
+    rank = {cid: i for i, cid in enumerate(cur_order)}
+    return sorted(conflicts, key=lambda c: (c["id"] not in rank, rank.get(c["id"], 0)))
 
 
 @app.post("/api/split")

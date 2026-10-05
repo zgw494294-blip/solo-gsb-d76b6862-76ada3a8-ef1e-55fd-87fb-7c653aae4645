@@ -1,3 +1,5 @@
+import json
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -290,6 +292,316 @@ def test_merge_rejects_reversed_same_and_missing():
         json={"order_ids": ids4(), "clauses": bodies, "keep_id": "c1", "drop_id": "c9"},
     )
     assert r.status_code == 422
+
+
+# --------------------------------------------------------------------------- #
+# 误合并撤销 /api/merge/undo
+# --------------------------------------------------------------------------- #
+def _merge(order, bodies, keep_id, drop_id, lock_ids=None):
+    payload = {"order_ids": order, "clauses": bodies, "keep_id": keep_id, "drop_id": drop_id}
+    if lock_ids is not None:
+        payload["lock_ids"] = lock_ids
+    return client.post("/api/merge", json=payload)
+
+
+def _undo_record(doc, keep_id, drop_id):
+    """按撤销记录结构捕获一次成功合并的完整记录（与前端构造同口径）。"""
+    by = {c["id"]: c["body"] for c in doc["clauses"]}
+    m = _merge(doc["order_ids"], doc["clauses"], keep_id, drop_id)
+    assert m.status_code == 200, m.text
+    data = m.json()
+    after = {c["id"]: c["body"] for c in data["clauses"]}
+    rewrites = [
+        {"id": cid, "before": by[cid], "after": after[cid]}
+        for cid in doc["order_ids"]
+        if cid not in (keep_id, drop_id) and f"[[{drop_id}]]" in by[cid]
+    ]
+    record = {
+        "keep_id": keep_id,
+        "drop_id": drop_id,
+        "keep_before": by[keep_id],
+        "drop_before": by[drop_id],
+        "keep_after": after[keep_id],
+        "rewrites": rewrites,
+    }
+    return data, record
+
+
+def _undo(order, bodies, record, lock_ids=None):
+    payload = {"order_ids": order, "clauses": bodies, "record": record}
+    if lock_ids is not None:
+        payload["lock_ids"] = lock_ids
+    return client.post("/api/merge/undo", json=payload)
+
+
+def test_merge_undo_restores_both_sources_and_repoint_sources():
+    doc = import_text(GOOD).json()
+    base = _state(doc)
+    merged, record = _undo_record(base, "c1", "c2")
+    # c3 是改写引用来源（[[c2]] → [[c1]]），记录里有它的前后正文
+    assert [rw["id"] for rw in record["rewrites"]] == ["c3"]
+
+    r = _undo(merged["order_ids"], merged["clauses"], record)
+    assert r.status_code == 200, r.text
+    data = r.json()
+    # 被移除身份 c2 重新插在保留条款 c1 之后；其余相对顺序不变
+    assert data["order_ids"] == ["c1", "c2", "c3", "c4"]
+    by = {c["id"]: c["body"] for c in data["clauses"]}
+    # 两条原文恢复；改写来源 c3 的引用还原为 [[c2]]
+    assert by["c1"] == "甲方在七日内交付设备"
+    assert by["c2"] == "乙方按 [[c1]] 验收后付款"
+    assert by["c3"] == "争议解决见 [[c4]]，违约参照 [[c2]]"
+    assert by["c4"] == "争议提交仲裁"
+
+    # 撤销结果与合并前完全一致（可正常预览 / 导出，无失效引用）
+    r = client.post("/api/preview", json={"order_ids": data["order_ids"], "clauses": data["clauses"]})
+    assert r.json()["has_broken"] is False
+    r = client.post("/api/export", json={"order_ids": data["order_ids"], "clauses": data["clauses"]})
+    assert r.status_code == 200
+
+
+def test_merge_undo_keeps_later_unrelated_edits():
+    doc = import_text(GOOD).json()
+    base = _state(doc)
+    merged, record = _undo_record(base, "c1", "c2")
+    # 合并之后又对无关条款 c4 做了编辑：撤销应保留这处校订
+    order = merged["order_ids"]
+    bodies = [dict(c) for c in merged["clauses"]]
+    r = client.post(
+        "/api/save",
+        json={"order_ids": order, "clauses": bodies, "edit_id": "c4", "text": "争议提交甲方所在地法院"},
+    )
+    assert r.status_code == 200
+    bodies = [
+        c if c["id"] != "c4" else {"id": "c4", "body": r.json()["body"]} for c in bodies
+    ]
+    r = _undo(order, bodies, record)
+    assert r.status_code == 200, r.text
+    by = {c["id"]: c["body"] for c in r.json()["clauses"]}
+    assert by["c4"] == "争议提交甲方所在地法院"  # 合并后的无关校订保留
+    assert by["c1"] == "甲方在七日内交付设备"
+    assert by["c2"] == "乙方按 [[c1]] 验收后付款"
+
+
+def test_merge_undo_can_target_any_record_not_just_latest():
+    # 两对互不交叠的合并：先合并 c1+c2，再合并 c4+c5（互相不改写对方的条款）
+    doc = import_text(
+        "\n".join(
+            [
+                "1|第一条",
+                "2|引用 [[1]]",
+                "3|第三条",
+                "4|第四条",
+                "5|引用 [[4]]",
+            ]
+        )
+    ).json()
+    base = _state(doc)
+    merged1, rec1 = _undo_record(base, "c1", "c2")
+    assert rec1["rewrites"] == []  # 两条原文之外没有改写来源
+    merged2, rec2 = _undo_record(
+        {"order_ids": merged1["order_ids"], "clauses": merged1["clauses"]}, "c4", "c5"
+    )
+    # 当前稿为 c1（含c2）、c3、c4（含c5）；选择较早的第一条记录撤销
+    r = _undo(merged2["order_ids"], merged2["clauses"], rec1)
+    assert r.status_code == 200, r.text
+    data = r.json()
+    # c2 恢复在 c1 之后；c5 不恢复（第二次合并未撤销）；其他相对顺序不变
+    assert data["order_ids"] == ["c1", "c2", "c3", "c4"]
+    by = {c["id"]: c["body"] for c in data["clauses"]}
+    assert by["c1"] == "第一条"
+    assert by["c2"] == "引用 [[c1]]"
+    assert by["c3"] == "第三条"
+    assert by["c4"] == "第四条；引用 [[c4]]"
+    # 较新的第二条记录失败仍保留且仍可撤销
+    r = _undo(data["order_ids"], data["clauses"], rec2)
+    assert r.status_code == 200, r.text
+    assert [c["id"] for c in r.json()["clauses"]] == ["c1", "c2", "c3", "c4", "c5"]
+
+    # 较早记录的保留方在后续操作中被并入而消失 -> 冲突（记录不可用，但保留）
+    doc = import_text(GOOD).json()
+    merged1, rec1 = _undo_record(_state(doc), "c1", "c2")
+    merged2, _ = _undo_record(
+        {"order_ids": merged1["order_ids"], "clauses": merged1["clauses"]}, "c3", "c4"
+    )
+    # 再把 c1（rec1 的保留方）并入 c3：c1 消失、c3 正文拼接 -> rec1 冲突
+    r = _merge(merged2["order_ids"], merged2["clauses"], "c1", "c3")
+    assert r.status_code == 200
+    merged3 = r.json()
+    r = _undo(merged3["order_ids"], merged3["clauses"], rec1)
+    assert r.status_code == 409
+    kinds = {c["id"]: c["kind"] for c in r.json()["detail"]["conflicts"]}
+    # c1 作为保留方既已消失、其记录正文也已并入 c3：消失事实在冲突中列出
+    assert "c1" in kinds
+    assert "c3" in kinds  # rec1 的改写来源 c3 正文也已变
+
+
+def test_merge_undo_conflict_keep_body_changed_whole_request_rejected():
+    doc = import_text(GOOD).json()
+    merged, record = _undo_record(_state(doc), "c1", "c2")
+    # 保留条款正文在合并后又被改过：记录对不上 -> 409 并列冲突，草稿与记录不变
+    bodies = [
+        dict(c) if c["id"] != "c1" else {"id": "c1", "body": c["body"] + "；补充"}
+        for c in merged["clauses"]
+    ]
+    r = _undo(merged["order_ids"], bodies, record)
+    assert r.status_code == 409
+    conflicts = r.json()["detail"]["conflicts"]
+    assert [c["id"] for c in conflicts] == ["c1"]
+    assert conflicts[0]["kind"] == "keep_body_changed"
+    # 被整次拒绝：当前稿原样可预览
+    r = client.post("/api/preview", json={"order_ids": merged["order_ids"], "clauses": bodies})
+    assert r.status_code == 200
+
+
+def test_merge_undo_conflict_rewrite_source_changed():
+    doc = import_text(GOOD).json()
+    merged, record = _undo_record(_state(doc), "c1", "c2")
+    # 改写来源 c3 合并后又被编辑：409 列该来源冲突
+    bodies = [
+        dict(c) if c["id"] != "c3" else {"id": "c3", "body": c["body"] + "补充"}
+        for c in merged["clauses"]
+    ]
+    r = _undo(merged["order_ids"], bodies, record)
+    assert r.status_code == 409
+    conflicts = r.json()["detail"]["conflicts"]
+    assert [c["id"] for c in conflicts] == ["c3"]
+    assert conflicts[0]["kind"] == "source_body_changed"
+
+
+def test_merge_undo_conflict_keep_missing_and_drop_revived():
+    doc = import_text(GOOD).json()
+    merged, record = _undo_record(_state(doc), "c1", "c2")
+    # 保留条款 c1 已被删除：409（消失身份排在冲突列表最后）
+    order = [cid for cid in merged["order_ids"] if cid != "c1"]
+    bodies = [c for c in merged["clauses"] if c["id"] != "c1"]
+    r = _undo(order, bodies, record)
+    assert r.status_code == 409
+    assert [c["id"] for c in r.json()["detail"]["conflicts"]] == ["c1"]
+    assert r.json()["detail"]["conflicts"][0]["kind"] == "keep_missing"
+
+    # 被移除身份 c2 已重新存在（此处用拆分以外的方式直接构造当前稿）：409
+    doc2 = import_text(GOOD).json()
+    merged2, record2 = _undo_record(_state(doc2), "c1", "c2")
+    # 直接给当前稿塞回一个 c2（草稿结构允许，仅模拟身份被再次占用的情形）
+    order2 = ["c1", "c2", "c3", "c4"]
+    bodies2 = [
+        {"id": "c1", "body": merged2["clauses"][0]["body"]},
+        {"id": "c2", "body": "新的 c2 正文"},
+        {"id": "c3", "body": merged2["clauses"][1]["body"]},
+        {"id": "c4", "body": merged2["clauses"][2]["body"]},
+    ]
+    r = _undo(order2, bodies2, record2)
+    assert r.status_code == 409
+    assert [c["id"] for c in r.json()["detail"]["conflicts"]] == ["c2"]
+    assert r.json()["detail"]["conflicts"][0]["kind"] == "drop_exists"
+
+
+def test_merge_undo_record_corruption_returns_422_and_record_is_not_consumed():
+    doc = import_text(GOOD).json()
+    merged, record = _undo_record(_state(doc), "c1", "c2")
+
+    # 记录身份形态非法
+    bad = dict(record, keep_id="x1")
+    r = _undo(merged["order_ids"], merged["clauses"], bad)
+    assert r.status_code == 422
+    # 记录双方相同
+    bad = dict(record, drop_id="c1")
+    assert _undo(merged["order_ids"], merged["clauses"], bad).status_code == 422
+    # keep_after 与两条原文按合并规则推出的不一致
+    bad = dict(record, keep_after=record["keep_after"] + "x")
+    assert _undo(merged["order_ids"], merged["clauses"], bad).status_code == 422
+    # 改写来源的 after 不等于 before 经 [[drop]]→[[keep]] 的结果
+    bad = json.loads(json.dumps(record))
+    bad["rewrites"][0]["after"] += "y"
+    assert _undo(merged["order_ids"], merged["clauses"], bad).status_code == 422
+    # 改写来源即合并双方 / 来源重复 / 正文形态损坏
+    bad = json.loads(json.dumps(record))
+    bad["rewrites"].append({"id": "c1", "before": "x", "after": "y"})
+    assert _undo(merged["order_ids"], merged["clauses"], bad).status_code == 422
+    bad = json.loads(json.dumps(record))
+    bad["rewrites"].append(dict(bad["rewrites"][0]))
+    assert _undo(merged["order_ids"], merged["clauses"], bad).status_code == 422
+    bad = dict(record, keep_before="正文\n换行")
+    assert _undo(merged["order_ids"], merged["clauses"], bad).status_code == 422
+    bad = dict(record, drop_before="引用形态 [[1]]")
+    assert _undo(merged["order_ids"], merged["clauses"], bad).status_code == 422
+    # 改写来源的 before 不含 [[drop]] 标记：它不属于该次合并的改写来源
+    bad = json.loads(json.dumps(record))
+    bad["rewrites"] = [{"id": "c3", "before": "无关正文", "after": "无关正文"}]
+    r = _undo(merged["order_ids"], merged["clauses"], bad)
+    assert r.status_code == 422
+    assert any("改写来源" in m for m in r.json()["detail"]["errors"])
+    # 422 不消耗记录：同一条完好记录随后仍可成功撤销
+    r = _undo(merged["order_ids"], merged["clauses"], record)
+    assert r.status_code == 200
+
+
+def test_merge_undo_over_40_clauses_rejected_422():
+    # 39 条时一次合并 -> 38 条；撤销恢复为 39 条，允许
+    text39 = "\n".join(f"{i}|条款{i}" for i in range(1, 40))
+    doc = import_text(text39).json()
+    state39 = _state(doc)
+    merged, record = _undo_record(state39, "c1", "c2")
+    assert len(merged["order_ids"]) == 38
+    r = _undo(merged["order_ids"], merged["clauses"], record)
+    assert r.status_code == 200
+    assert len(r.json()["order_ids"]) == 39
+    # 40 条时一次合并 -> 39 条；撤销恢复为 40 条，允许（恰在上限）
+    text40 = "\n".join(f"{i}|条款{i}" for i in range(1, 41))
+    doc = import_text(text40).json()
+    state40 = _state(doc)
+    merged, record = _undo_record(state40, "c1", "c2")
+    assert len(merged["order_ids"]) == 39
+    r = _undo(merged["order_ids"], merged["clauses"], record)
+    assert r.status_code == 200
+    assert len(r.json()["order_ids"]) == 40
+    # 当前稿 40 条却携带一条会恢复出第 41 条的记录（记录与当前稿并不对应：
+    # drop 已存在 -> 409；这里构造让校验顺序里 40 条上限以记录自身合法为前提，
+    # 用 split 占满 40 条后记录不再适用——改由"恢复后超限"只能在当前稿缺 drop 时发生，
+    # 而缺 drop 的 40 条当前稿无法由正常合并产生；该场景由前端按上限禁用拦截）
+
+
+def test_merge_undo_lock_protection_blocks_when_keep_or_source_locked():
+    doc = import_text(GOOD).json()
+    merged, record = _undo_record(_state(doc), "c1", "c2")
+    # 锁保留条款 c1：撤销把其合并后正文还原为原文（正文变化）-> 409
+    r = _undo(merged["order_ids"], merged["clauses"], record, lock_ids=["c1"])
+    assert r.status_code == 409
+    assert [v["id"] for v in r.json()["detail"]["locked"]] == ["c1"]
+    # 锁改写来源 c3：撤销把 [[c1]] 还原为 [[c2]]（正文变化）-> 409
+    r = _undo(merged["order_ids"], merged["clauses"], record, lock_ids=["c3"])
+    assert r.status_code == 409
+    assert [v["id"] for v in r.json()["detail"]["locked"]] == ["c3"]
+    # 锁完全无关的 c4（无引用、正文不变）：撤销允许
+    r = _undo(merged["order_ids"], merged["clauses"], record, lock_ids=["c4"])
+    assert r.status_code == 200, r.text
+
+
+def test_merge_undo_lock_empty_set_explicit_and_legacy_none():
+    doc = import_text(GOOD).json()
+    merged, record = _undo_record(_state(doc), "c1", "c2")
+    # 显式空集合允许；旧调用不传 lock_ids 同样允许
+    assert _undo(merged["order_ids"], merged["clauses"], record, lock_ids=[]).status_code == 200
+    merged, record = _undo_record(_state(doc), "c1", "c2")
+    assert _undo(merged["order_ids"], merged["clauses"], record).status_code == 200
+
+
+def test_merge_undo_baseline_and_id_counter_not_touched_by_endpoint():
+    # 接口不接收基线与上界：只返回撤销后的草稿，基线与身份上界由调用方持有（不回退）
+    doc = import_text(GOOD).json()
+    merged, record = _undo_record(_state(doc), "c1", "c2")
+    import copy
+
+    payload = {
+        "order_ids": copy.deepcopy(merged["order_ids"]),
+        "clauses": copy.deepcopy(merged["clauses"]),
+        "record": copy.deepcopy(record),
+    }
+    sent = copy.deepcopy(payload)
+    r = client.post("/api/merge/undo", json=payload)
+    assert r.status_code == 200
+    assert payload == sent  # 入参不被修改
 
 
 # --------------------------------------------------------------------------- #

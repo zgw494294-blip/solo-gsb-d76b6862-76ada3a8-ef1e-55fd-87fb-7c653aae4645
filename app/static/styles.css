@@ -361,6 +361,26 @@ button.danger:hover:not(:disabled) { background: var(--danger-bg); }
 .diff-text.none { color: var(--muted); background: transparent; border-style: dashed; }
 .diff-text .ref { cursor: default; }
 
+/* 合并撤销记录 */
+.merge-record {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fff;
+  padding: 9px 12px;
+  margin-bottom: 10px;
+}
+.merge-record.is-stale { background: var(--danger-bg); border-color: #f3c4c4; }
+.merge-undo-bodies {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  gap: 10px;
+  padding-left: 2px;
+}
+@media (max-width: 1100px) { .merge-undo-bodies { grid-template-columns: 1fr; } }
+.merge-undo-rewrites { margin-top: 6px; padding-left: 2px; }
+.merge-undo-rewrites .diff-row, .merge-undo-rewrites .invalid-row { margin-bottom: 6px; }
+.merge-panel .editor-actions { margin-top: 8px; }
+
 /* --------------------------------------------------------------------------- */
 /* 谁引用本条（卡片内联展开的只读查询） */
 /* --------------------------------------------------------------------------- */

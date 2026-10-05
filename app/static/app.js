@@ -23,7 +23,7 @@ const state = {
   previewFresh: false, // 页面预览是否已追上最新草稿；未追上时禁止下载与合并
   importing: false, // /api/import 在途（期间忽略重复提交）
   saving: false, // /api/save 在途
-  writing: null, // 在途写稿提交（null | "merge" | "split" | "duplicate" | "delete"）：合并 / 拆分 / 复制 / 删除共用的
+  writing: null, // 在途写稿提交（null | "merge" | "merge-undo" | "split" | "duplicate" | "delete"）：合并 / 撤销合并 / 拆分 / 复制 / 删除共用的
   // 提交协调层状态；提交期间阻止其他改稿与重复提交，但允许重新导入与切换条款锁定
   exporting: false, // /api/export 在途
   baseline: null, // 成功导入后不可变的原稿基线（{ order_ids, clauses }，深拷贝）；重新导入清空
@@ -41,6 +41,9 @@ const state = {
   reviews: [], // 逐条复核记录：[{ id, bodies: { 条款id: 内部正文 } }]——每条记录含被复核条款的
   // 稳定身份，以及复核当刻它自身和全部可达引用条款（循环只计一次）的内部正文；
   // 仅存本页内存：重新导入、成功恢复存档或刷新后清空，不进入存档快照
+  mergeRecords: [], // 误合并撤销记录：每次合并成功建立一条（{ keep_id, drop_id, keep_before,
+  // drop_before, keep_after, rewrites: [{ id, before, after }] }）；仅存本页内存：
+  // 换稿（重新导入）或成功恢复存档即清空，不进入存档快照；成功撤销后该记录移除，失败保留
   reviewExporting: false, // /api/review/export 在途（期间忽略重复下载）
   archiveVersion: null, // 最近读取或保存成功得到的服务端存档版本；null 表示尚未读取 / 保存过
   archiveDirty: false, // 草稿是否有未存档改动：任何改稿置真，保存成功（期间未再改）或恢复后复位
@@ -105,6 +108,8 @@ const archiveSaveBtn = $("#archive-save-btn");
 const archiveRestoreBtn = $("#archive-restore-btn");
 const archiveRestoreImportBtn = $("#archive-restore-import-btn");
 const archiveBanner = $("#archive-banner");
+const mergePanel = $("#merge-panel");
+const mergeBody = $("#merge-body");
 
 // --------------------------------------------------------------------------- //
 // 工具
@@ -416,6 +421,7 @@ function syncToolbar() {
   updateDownloadBtn();
   syncArchiveUi();
   syncReviewPanel();
+  syncMergePanel();
   syncBusy();
 }
 
@@ -818,6 +824,8 @@ function installArchive(snap, version) {
   state.reviews = [];
   state.reviewExporting = false;
   reviewExportSeq += 1;
+  // 合并撤销记录仅存本页内存：成功恢复存档即清空（存档快照不含撤销记录）
+  state.mergeRecords = [];
   state.preview = null;
   state.previewError = null;
   state.renderedRev = null;
@@ -912,6 +920,8 @@ importBtn.addEventListener("click", async () => {
     // 复核记录仅存本页内存：新草稿的复核重新开始（记录不进存档快照）
     state.reviews = [];
     state.reviewExporting = false;
+    // 合并撤销记录仅存本页内存：新草稿重新开始（不进存档快照）
+    state.mergeRecords = [];
     // 新草稿的存档交互重新开始：保留服务端版本知识（仍有效），清掉旧提示；
     // touch() 会把新稿标记为未存档
     state.archiveError = null;
@@ -989,6 +999,8 @@ $("#reimport-btn").addEventListener("click", () => {
   state.reviews = [];
   state.reviewExporting = false;
   reviewExportSeq += 1;
+  // 合并撤销记录仅存本页内存：重新导入即清空
+  state.mergeRecords = [];
   previewInFlight = false; // 上一草稿在途预览的收尾将因世代不符而直接返回，这里复位在途态
   desk.hidden = true;
   importPanel.hidden = false;
@@ -1278,13 +1290,14 @@ function editorHtml(item) {
 //   错误归一化后交回入口按各自方式展示。
 // 入口只负责本地预检、参数准备、确认与各自的错误展示；取消不经过这里（不发写稿请求）。
 // spec = {
-//   kind,              // "merge" | "split" | "duplicate" | "delete"
+//   kind,              // "merge" | "merge-undo" | "split" | "duplicate" | "delete"
 //   path,              // 接口路径（POST JSON，HTTP 方法 / 字段 / 状态码保持既有约定）
 //   params,            // 入口备好的接口参数（草稿快照与 lock_ids 由协调层统一附上）
 //   repointed?,        // 成功回包按最新锁定集合核验时的统一改指映射（合并 / 拆分落后段）
 //   onSuccess(data)?,  // 入口附加的成功处理（如收起被并条款的引用面板、退出拆分选择器）
 //   onError(errors)?,  // 入口各自的错误展示（errors 已归一化为字符串数组）
 //   onBusy(busy)?,     // 入口自己的忙碌态展示（如拆分选择器按钮；成功不写回时不再复位）
+//   checkLocks?(data, lockIds)?, // 自定义回包锁定核验（默认按 repointed 统一核验）
 // }
 async function submitWrite(spec) {
   if (state.writing) return; // 已有写稿提交在途：阻止重复提交与其他写稿
@@ -1564,12 +1577,21 @@ mergeBtn.addEventListener("click", async () => {
     alert(formatLockViolations(localMergeViolations).join("\n"));
     return;
   }
+  // 捕获合并当刻的两条原文与全部改写引用来源（其余正文中含 [[dropId]] 标记的条款）：
+  // 撤销记录据此建立；仅在服务端成功且本地锁定核验通过后才入列（失败不产生记录）
+  const beforeBodies = new Map(state.clauses.map((c) => [c.id, c.body]));
+  const keepBefore = beforeBodies.get(keepId);
+  const dropBefore = beforeBodies.get(dropId);
+  const rewriteBefore = new Map();
+  for (const c of state.clauses) {
+    if (c.id !== keepId && c.id !== dropId && c.body.includes(`[[${dropId}]]`)) {
+      rewriteBefore.set(c.id, c.body);
+    }
+  }
   const previewById = Object.fromEntries(state.preview.items.map((it) => [it.id, it]));
   const keep = previewById[keepId];
   const drop = previewById[dropId];
-  const inbound = state.clauses.filter(
-    (c) => c.body.includes(`[[${dropId}]]`),
-  ).length;
+  const inbound = rewriteBefore.size;
 
   const msg =
     `将把当前第 ${drop.display} 条并入第 ${keep.display} 条：\n\n` +
@@ -1578,9 +1600,9 @@ mergeBtn.addEventListener("click", async () => {
     `合并后正文（全角分号连接）：\n${keep.text}；${drop.text}\n\n` +
     `合并结果沿用第 ${keep.display} 条（原第 ${keep.original} 条）的位置与身份，` +
     `第 ${drop.display} 条移除，其余条款顺序不变。\n` +
-    `共有 ${inbound} 处引用指向第 ${drop.display} 条，合并后全部改指合并结果；` +
+    `共有 ${inbound} 条条款引用第 ${drop.display} 条，合并后全部改指合并结果；` +
     `其他引用不变，已失效引用仍保持失效。\n` +
-    `此操作在重新导入或刷新前不可撤销，确定合并？`;
+    `误合并可随后在「合并撤销」面板撤回到当时草稿（仅本页保留，重新导入或恢复存档清空），确定合并？`;
   if (!confirm(msg)) return;
 
   // 请求归属、草稿写回（合并不推进身份上界）与收尾由提交协调层统一处理
@@ -1589,10 +1611,27 @@ mergeBtn.addEventListener("click", async () => {
     path: "/api/merge",
     params: { keep_id: keepId, drop_id: dropId },
     repointed: { [dropId]: keepId }, // 回包核验时区分"改指"与"目标删除"
-    onSuccess: () => {
+    onSuccess: (data) => {
+      // 合并已写回草稿：从回包取合并后正文建立撤销记录（新记录列在最前）。
+      // 两条原文自身的前后正文在记录顶层单列；其余改写来源的 after 取自回包
+      const afterById = new Map(data.clauses.map((c) => [c.id, c.body]));
+      const record = {
+        keep_id: keepId,
+        drop_id: dropId,
+        keep_before: keepBefore,
+        drop_before: dropBefore,
+        keep_after: afterById.get(keepId),
+        rewrites: [...rewriteBefore.keys()].map((cid) => ({
+          id: cid,
+          before: rewriteBefore.get(cid),
+          after: afterById.get(cid),
+        })),
+      };
+      state.mergeRecords.unshift(record);
       // 被并入的较后条款已移除：查询它的面板立即收起清空（查较前条款的保留并自动重查）
       if (state.refsId === dropId) closeReferrers();
       state.pickIds = [];
+      syncMergePanel();
     },
     onError: (errors) => {
       // 合并失败：草稿未改动，勾选保持不变，可修正后重试
@@ -1600,6 +1639,149 @@ mergeBtn.addEventListener("click", async () => {
     },
   });
 });
+
+// --------------------------------------------------------------------------- //
+// 误合并撤销（记录仅存本页；HTTP /api/merge/undo 整次应用，无重做）
+// --------------------------------------------------------------------------- //
+// 内部正文解析为当前显示文本（与服务端 resolve_body 同口径），用于记录面板展示
+function resolveInternalBody(body) {
+  let out = "";
+  let last = 0;
+  for (const m of body.matchAll(/\[\[(c\d+)\]\]/g)) {
+    out += body.slice(last, m.index);
+    const pos = state.orderIds.indexOf(m[1]);
+    out += pos >= 0 ? `[[${pos + 1}]]` : `[[原${m[1].slice(1)}?]]`;
+    last = m.index + m[0].length;
+  }
+  return out + body.slice(last);
+}
+
+// 按当前草稿快速判断记录是否还能对得上（权威核对仍在服务端；这里只用于按钮提示与标灰）：
+// 保留条款与改写来源仍在且正文等于合并后值、被移除身份仍不存在
+function mergeRecordStale(rec) {
+  const byId = new Map(state.clauses.map((c) => [c.id, c.body]));
+  if (!byId.has(rec.keep_id) || byId.get(rec.keep_id) !== rec.keep_after) return true;
+  if (byId.has(rec.drop_id)) return true;
+  for (const rw of rec.rewrites) {
+    if (!byId.has(rw.id) || byId.get(rw.id) !== rw.after) return true;
+  }
+  return false;
+}
+
+function syncMergePanel() {
+  if (!state.mergeRecords.length) {
+    mergePanel.hidden = true;
+    mergeBody.innerHTML = "";
+    return;
+  }
+  mergePanel.hidden = false;
+  // 写稿（含撤销本身）在途、未完成编辑或拆分选择时不可撤销
+  const blocked = state.writing !== null || state.editingId !== null || state.splittingId !== null;
+  const busy = state.writing === "merge-undo";
+  const items = state.mergeRecords
+    .map((rec, idx) => {
+      const stale = mergeRecordStale(rec);
+      const keepNo = state.orderIds.indexOf(rec.keep_id) + 1;
+      const keepNoText = keepNo > 0 ? `（当前第 ${keepNo} 条）` : "（当前已不在草稿）";
+      const rewriteRows = rec.rewrites
+        .map((rw) => {
+          const no = state.orderIds.indexOf(rw.id) + 1;
+          const where = no > 0 ? `当前第 ${no} 条` : "当前已不在草稿";
+          return (
+            `<li><span class="diff-id">${esc(rw.id)}（${where}）</span>` +
+            `<div class="merge-undo-bodies">` +
+            `<div class="diff-col"><span class="diff-col-label">合并前</span><div class="diff-text">${esc(resolveInternalBody(rw.before))}</div></div>` +
+            `<div class="diff-col"><span class="diff-col-label">合并后（当前应为此值）</span><div class="diff-text">${esc(resolveInternalBody(rw.after))}</div></div>` +
+            `</div></li>`
+          );
+        })
+        .join("");
+      return (
+        `<li class="merge-record${stale ? " is-stale" : ""}">` +
+        `<div class="diff-row-head">` +
+        `<span class="diff-tag ${stale ? "tag-del" : "tag-body"}">${stale ? "可能已失效" : "可撤销"}</span>` +
+        `<span class="diff-nums">保留 ${esc(rec.keep_id)}${esc(keepNoText)} · 移除 ${esc(rec.drop_id)}（原第 ${rec.drop_id.slice(1)} 条）</span>` +
+        `</div>` +
+        `<div class="merge-undo-bodies">` +
+        `<div class="diff-col"><span class="diff-col-label">保留条款合并前</span><div class="diff-text">${esc(resolveInternalBody(rec.keep_before))}</div></div>` +
+        `<div class="diff-col"><span class="diff-col-label">被移除条款原文</span><div class="diff-text">${esc(resolveInternalBody(rec.drop_before))}</div></div>` +
+        `<div class="diff-col"><span class="diff-col-label">保留条款合并后</span><div class="diff-text">${esc(resolveInternalBody(rec.keep_after))}</div></div>` +
+        `</div>` +
+        (rewriteRows ? `<div class="merge-undo-rewrites"><span class="diff-col-label">其他改写引用来源（${rec.rewrites.length}）</span><ul class="diff-list">${rewriteRows}</ul></div>` : "") +
+        `<div class="editor-actions"><button type="button" class="primary" data-action="merge-undo" data-index="${idx}"${
+          blocked || busy ? " disabled" : ""
+        } title="${
+          busy
+            ? "撤销提交中…"
+            : blocked
+              ? "未完成编辑、拆分选择或写稿时不可撤销"
+              : "恢复两条原文与各改写来源的合并前正文（无重做）"
+        }">${busy ? "撤销中…" : "撤销这次合并"}</button></div>` +
+        `</li>`
+      );
+    })
+    .join("");
+  mergeBody.innerHTML = `<ul class="diff-list">${items}</ul>`;
+}
+
+// 撤销一次合并：未完成编辑 / 拆分 / 写稿时不可撤销；提交沿用写稿协调层
+// （互斥、最新锁定核验、旧响应隔离），成功后该记录移除并刷新预览（预览失败保留撤销稿，仅重试预览）。
+mergePanel.addEventListener("click", async (ev) => {
+  const btn = ev.target.closest('[data-action="merge-undo"]');
+  if (!btn) return;
+  if (state.writing) return;
+  if (state.editingId || state.splittingId) return;
+  const idx = parseInt(btn.dataset.index, 10);
+  const record = state.mergeRecords[idx];
+  if (!record) return;
+
+  // 本地快速核对（权威核对仍在服务端）：明显对不上的记录直接提示，不发请求、记录保留
+  if (mergeRecordStale(record)) {
+    alert(
+      "该合并记录与当前草稿对不上（保留条款或改写来源正文已变、被移除身份已恢复），\n" +
+        "服务端也会按记录整次拒绝；记录已保留。",
+    );
+    return;
+  }
+  if (state.orderIds.length + 1 > MAX_CLAUSES) {
+    alert(`撤销后共 ${state.orderIds.length + 1} 条，超过上限 ${MAX_CLAUSES} 条，不能撤销。`);
+    return;
+  }
+  const ok = confirm(
+    `将恢复原第 ${record.keep_id.slice(1)} 条与原第 ${record.drop_id.slice(1)} 条的合并前正文，\n` +
+      `被移除身份 ${record.drop_id} 插在保留条款 ${record.keep_id} 之后；其余正文与相对顺序不变。\n` +
+      `原稿基线不变、身份上界不回退；撤销后该记录不可再用（无重做）。确定撤销？`,
+  );
+  if (!ok) return;
+
+  await submitWrite({
+    kind: "merge-undo",
+    path: "/api/merge/undo",
+    params: { record: roundTripMergeRecord(record) },
+    onSuccess: () => {
+      // 撤销成功：记录不可再用（仅移除被撤销的这一条，其余记录保留——失败仍可再用）
+      state.mergeRecords.splice(idx, 1);
+      syncMergePanel();
+    },
+    onError: (errors) => {
+      // 撤销被拒（422 记录损坏 / 409 冲突或锁定保护）：草稿与记录都保留
+      alert("撤销失败，草稿与合并记录均未改动：\n" + errors.join("\n"));
+      syncMergePanel();
+    },
+  });
+});
+
+// 记录随请求体提交：纯 JSON 数据，深拷贝隔离页面内之后可能的变化
+function roundTripMergeRecord(rec) {
+  return {
+    keep_id: rec.keep_id,
+    drop_id: rec.drop_id,
+    keep_before: rec.keep_before,
+    drop_before: rec.drop_before,
+    keep_after: rec.keep_after,
+    rewrites: rec.rewrites.map((rw) => ({ id: rw.id, before: rw.before, after: rw.after })),
+  };
+}
 
 // --------------------------------------------------------------------------- //
 // 复制所选一组条款
