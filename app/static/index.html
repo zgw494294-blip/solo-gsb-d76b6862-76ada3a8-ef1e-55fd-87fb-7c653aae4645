@@ -92,6 +92,22 @@
         <div id="excerpt-body"></div>
       </section>
 
+      <!-- 合并记录：每次成功合并留一条撤销记录（仅存本页内存），可撤回到当前草稿 -->
+      <section id="merge-panel" class="panel merge-panel">
+        <div class="merge-head">
+          <h2>合并记录（撤销误合并）</h2>
+          <div class="merge-status" id="merge-status"></div>
+        </div>
+        <p class="hint">
+          每次成功合并都会在此列出一条记录：两条原文及所有改写引用来源（引用被改指的条款）合并前后的内部正文。
+          点「撤销该合并」可把误合并<b>撤回到当前草稿</b>：恢复两条原文（被移除身份插在保留条款之后）与各来源正文，
+          合并之后与该次无关的校订保留；其他正文与相对顺序不变，原稿基线不变、身份上界不回退。
+          记录仅存本页：<b>重新导入、恢复存档或刷新后清空</b>；撤销成功后该条记录不可再用，失败则保留。
+          当前正文已偏离合并后状态、被移除身份已重新出现、撤销后超过 40 条或违反当前锁定保护时整次拒绝并列冲突。
+        </p>
+        <div id="merge-body"></div>
+      </section>
+
       <!-- 逐条复核：记录仅存本页内存；全部现存条款已复核且无失效引用时可下载复核稿 -->
       <section id="review-panel" class="panel review-panel">
         <div class="review-head">

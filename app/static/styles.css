@@ -461,3 +461,22 @@ button.danger:hover:not(:disabled) { background: var(--danger-bg); }
 .archive-banner { font-size: 13.5px; }
 .archive-banner ul { margin: 8px 0 0; padding-left: 20px; }
 .archive-banner .preview-error-actions { align-items: center; }
+
+/* --------------------------------------------------------------------------- */
+/* 合并记录与误合并撤销 */
+/* --------------------------------------------------------------------------- */
+.merge-panel { border-color: #f3d9a4; background: #fffdf7; }
+.merge-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+.merge-head h2 { margin-bottom: 4px; }
+.merge-status { font-size: 12.5px; color: var(--muted); }
+.merge-list { list-style: none; margin: 0; padding: 0; }
+.merge-row { border: 1px solid #ecd9b0; border-radius: 6px; padding: 10px 12px; margin: 8px 0; background: #fff; }
+.merge-row-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
+.merge-row-head button { margin-left: auto; }
+.merge-origins { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 6px; }
+.merge-origins .diff-col { flex: 1 1 240px; }
+.merge-sources { font-size: 13px; }
+.merge-source-list { margin: 4px 0 0; padding-left: 20px; }
+.merge-source-list li { padding: 2px 0; }
+.merge-body-before, .merge-body-after { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12.5px; }
+.merge-empty { color: var(--muted); font-size: 13px; margin: 4px 0; }

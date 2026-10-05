@@ -10,6 +10,12 @@
 - 合并两条条款时，按当前显示顺序用全角分号连接正文；合并结果沿用较前条款的稳定 id，
   较后条款删除，其 id 在所有正文中（含两条待合并正文）统一改写为较前条款 id。
   其他引用保持不动；已失效引用（id 已不存在于草稿）不会因合并恢复，仍保持失效。
+  每次成功合并由调用方（页面内存）留存一条撤销记录：两条待合并条款合并前的内部
+  正文，以及合并时所有被改写引用来源（除保留 / 移除外引用了较后 id 的条款）的前后
+  内部正文。``POST /api/merge/undo`` 据当前稿、记录与锁定集合整次核验后撤回到当前稿：
+  保留条款及各来源正文须仍等于合并后值、被移除身份须仍不存在，否则整次拒绝并列冲突；
+  通过后恢复两条原文（被移除身份插在保留条款之后）与各来源正文，其他正文与相对顺序
+  不变，原稿基线不变、身份上界不回退；撤销同样受当前锁定集合与 40 条上限保护。
 - 拆分一条条款时，在指定分界处把已保存正文切成前后两段：分界不能切开引用标记，
   两段都不能只含空白，其余字符原样保留。前段沿用原稳定 id，后段使用前端分配的、
   本草稿从未用过的全新 id（被删除或合并移除的 id 不复用，已有失效引用不会因此复活）；
@@ -79,8 +85,9 @@
   核验，而不是只看操作对象是否在集合中。
 - 集合重复、含形态非法或草稿中不存在的身份时整次拒绝（422）；旧调用不传 ``lock_ids``
   仍按原规则处理（等同没有任何锁定）。
-- 保存、删除、合并、拆分只要改变任一锁定条款（稳定身份消失、内部正文逐字变化）或使锁定
-  条款的有效引用失去现存目标，即整次拒绝（409）：草稿、身份上界与复核记录均不变；
+- 保存、删除、合并、合并撤销、拆分只要改变任一锁定条款（稳定身份消失、内部正文逐字
+  变化）或使锁定条款的有效引用失去现存目标 / 被统一改指，即整次拒绝（409）：草稿、
+  身份上界与复核记录均不变；
   按结果当前顺序逐个列出受影响的锁定身份及原因。**重排与编号变化允许**；锁定不冻结
   被引用条款的正文（只保证引用目标仍存在）。复制始终允许，副本取得新身份、不锁定。
 - 含失效引用的条款不能锁定（该状态无法保证"有效引用的目标存续"）；锁定后引用一旦失效，
@@ -153,6 +160,31 @@ class MergeIn(BaseModel):
     clauses: list[ClauseIn]
     keep_id: str  # 合并后沿用的身份（当前显示顺序中较前的一条）
     drop_id: str  # 被并入并移除的一条（当前显示顺序中较后的一条）
+    lock_ids: list[str] | None = None
+
+
+class MergeUndoSourceIn(BaseModel):
+    # 合并时一个被改写引用来源（除保留条款与被移除条款外引用了较后 id 的条款）的
+    # 前后内部正文：body 为合并前原文，after_body 为合并改写后的正文
+    id: str
+    body: str
+    after_body: str
+
+
+class MergeUndoRecordIn(BaseModel):
+    # 一次成功合并的撤销记录（页面内存留存、不进存档）：保留 / 移除身份、
+    # 两条合并前原文与所有改写引用来源的前后内部正文
+    keep_id: str
+    drop_id: str
+    keep_body: str
+    drop_body: str
+    sources: list[MergeUndoSourceIn]
+
+
+class MergeUndoIn(BaseModel):
+    order_ids: list[str]
+    clauses: list[ClauseIn]
+    record: MergeUndoRecordIn  # 要撤销的成功合并记录
     lock_ids: list[str] | None = None
 
 
@@ -622,6 +654,156 @@ def merge_clauses(payload: MergeIn):
             _raise_lock_violations(violations)
 
     return {"order_ids": new_order, "clauses": merged}
+
+
+def _validate_internal_body(label: str, body: str, errors: list[str]) -> None:
+    """校验一条内部形态正文（非空、单行、引用标记均为合法 id、无游离方括号）。"""
+    if body.strip() == "":
+        errors.append(f"{label}正文为空")
+    if "\n" in body:
+        errors.append(f"{label}不是单行条款")
+    for m in MARKER_RE.finditer(body):
+        if not ID_RE.match(m.group(1)):
+            errors.append(f"{label}内部引用形态损坏：{m.group(0)}")
+    if _stray_opens(body) or _stray_closes(body):
+        errors.append(f"{label}存在未闭合标记")
+
+
+@app.post("/api/merge/undo")
+def undo_merge(payload: MergeUndoIn):
+    """把一次误合并撤回到当前草稿。
+
+    撤销记录（仅由调用方页面内存留存，不进存档）含两条待合并条款合并前的内部
+    正文（``keep_body`` / ``drop_body``）与合并时所有被改写引用来源（除保留 / 移除
+    外引用了较后 id 的条款）的前后内部正文。核验通过后：
+
+    - 保留条款正文恢复为 ``keep_body``，各来源正文恢复为各自合并前原文，
+      被移除身份以 ``drop_body`` 重新插在保留条款**当前**位置之后；
+    - 其他条款正文与相对顺序不变；原稿基线不变、身份上界不回退（由调用方持有）。
+
+    记录结构非法（身份形态、来源重复 / 越界、正文形态损坏、来源前后正文与合并
+    改写不一致等）返回 422；保留条款或来源已不存在 / 正文偏离合并后值、被移除
+    身份已重新出现等语义冲突返回 409 并列冲突；撤销后超过 40 条或违反当前锁定
+    保护同样整次拒绝（422 / 409）。
+    """
+    by_id = _validate_state(payload.order_ids, payload.clauses)
+    lock_ids = _normalize_lock_ids(payload.lock_ids, by_id)
+    rec = payload.record
+
+    # ---- 1. 记录结构校验（422）：记录本身损坏与当前稿无关 ---------------------
+    errors: list[str] = []
+    if not ID_RE.match(rec.keep_id):
+        errors.append(f"保留身份非法：{rec.keep_id}")
+    if not ID_RE.match(rec.drop_id):
+        errors.append(f"被移除身份非法：{rec.drop_id}")
+    if rec.keep_id == rec.drop_id and ID_RE.match(rec.keep_id):
+        errors.append("保留身份与被移除身份不得相同")
+    _validate_internal_body("保留条款合并前", rec.keep_body, errors)
+    _validate_internal_body("被移除条款合并前", rec.drop_body, errors)
+
+    source_seen: set[str] = set()
+    for src in rec.sources:
+        if not ID_RE.match(src.id):
+            errors.append(f"改写来源身份非法：{src.id}")
+            continue
+        if src.id in source_seen:
+            errors.append(f"改写来源重复：{src.id}")
+        source_seen.add(src.id)
+        if src.id in (rec.keep_id, rec.drop_id):
+            errors.append(f"改写来源 {src.id} 不能是保留身份或被移除身份")
+        _validate_internal_body(f"改写来源 {src.id} 合并前", src.body, errors)
+        _validate_internal_body(f"改写来源 {src.id} 合并后", src.after_body, errors)
+
+    # 撤销后条数上限：被移除身份重新插回，比当前稿多 1 条
+    if len(payload.order_ids) + 1 > MAX_LINES:
+        errors.append(
+            f"撤销后共 {len(payload.order_ids) + 1} 条，超过上限 {MAX_LINES} 条，不能撤销"
+        )
+    if errors:
+        raise HTTPException(422, detail={"errors": errors})
+
+    def repoint_merge(m: re.Match) -> str:
+        return f"[[{rec.keep_id if m.group(1) == rec.drop_id else m.group(1)}]]"
+
+    # 记录自洽性：来源的“合并后正文”必须恰为其原文经合并统一改写的结果；
+    # 真正的合并记录一定满足，损坏 / 篡改的记录在这里以 422 拒绝
+    consistency_errors: list[str] = []
+    for src in rec.sources:
+        if not ID_RE.match(src.id):
+            continue
+        expected_after = MARKER_RE.sub(repoint_merge, src.body)
+        if src.after_body != expected_after:
+            consistency_errors.append(
+                f"改写来源 {src.id} 的前后正文与合并改写不一致（记录已损坏，无法撤销）"
+            )
+    if consistency_errors:
+        raise HTTPException(422, detail={"errors": consistency_errors})
+
+    # 保留条款的合并后值：两条原文经全角分号拼接、较后 id 统一改指保留 id
+    merged_keep_body = MARKER_RE.sub(
+        repoint_merge, f"{rec.keep_body}；{rec.drop_body}"
+    )
+
+    # ---- 2. 语义冲突（409）：当前稿须仍停留在合并后的状态 --------------------
+    conflicts: list[dict] = []
+
+    def add_conflict(clause_id: str, reason: str) -> None:
+        bucket = next((c for c in conflicts if c["id"] == clause_id), None)
+        if bucket is None:
+            bucket = {"id": clause_id, "original": int(clause_id[1:]), "reasons": []}
+            conflicts.append(bucket)
+        if reason not in bucket["reasons"]:
+            bucket["reasons"].append(reason)
+
+    if rec.keep_id not in by_id:
+        add_conflict(rec.keep_id, "保留身份在当前草稿中已不存在，无法撤销该次合并")
+    elif by_id[rec.keep_id].body != merged_keep_body:
+        add_conflict(
+            rec.keep_id,
+            "当前正文不等于合并后正文（合并之后又有校订），整次撤销拒绝",
+        )
+    for src in rec.sources:
+        if src.id not in by_id:
+            add_conflict(src.id, "改写引用来源身份在当前草稿中已不存在，无法撤销该次合并")
+        elif by_id[src.id].body != src.after_body:
+            add_conflict(
+                src.id,
+                "当前正文不等于合并后正文（合并之后又有校订），整次撤销拒绝",
+            )
+    if rec.drop_id in by_id:
+        add_conflict(rec.drop_id, "被移除身份在当前草稿中已重新出现，撤销记录已不适用")
+
+    if conflicts:
+        lines = ["本次撤销与当前草稿冲突，整次拒绝，冲突如下："]
+        for c in conflicts:
+            for reason in c["reasons"]:
+                lines.append(f"身份 {c['id']}（原第 {c['original']} 条）：{reason}")
+        raise HTTPException(409, detail={"errors": lines, "conflicts": conflicts})
+
+    # ---- 3. 构造撤销结果：恢复两条原文与来源正文，drop 插在 keep 之后 ----------
+    restore_by = {rec.keep_id: rec.keep_body}
+    restore_by.update({src.id: src.body for src in rec.sources})
+
+    new_clauses: list[dict] = []
+    new_order: list[str] = []
+    for cid in payload.order_ids:
+        body = restore_by.get(cid, by_id[cid].body)
+        new_clauses.append({"id": cid, "body": body})
+        new_order.append(cid)
+        if cid == rec.keep_id:
+            new_clauses.append({"id": rec.drop_id, "body": rec.drop_body})
+            new_order.append(rec.drop_id)
+
+    # ---- 4. 锁定核验：按撤销后的实际结果（正文恢复、被移除身份重新出现） ------
+    if lock_ids is not None:
+        new_by = {item["id"]: ClauseIn(**item) for item in new_clauses}
+        violations = _lock_violations(
+            by_id, new_order, new_by, lock_ids, repointed={rec.keep_id: rec.drop_id}
+        )
+        if violations:
+            _raise_lock_violations(violations)
+
+    return {"order_ids": new_order, "clauses": new_clauses}
 
 
 @app.post("/api/split")

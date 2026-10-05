@@ -1865,3 +1865,374 @@ def test_reorder_allowed_under_lock():
     )
     assert r.status_code == 200
     assert r.json()["items"][0]["id"] == "c4"
+
+
+# --------------------------------------------------------------------------- #
+# 误合并撤销 POST /api/merge/undo
+# --------------------------------------------------------------------------- #
+UNDO_DOC = {
+    "order_ids": ["c1", "c2", "c3", "c4"],
+    "clauses": [
+        {"id": "c1", "body": "甲方在七日内交付设备"},
+        {"id": "c2", "body": "乙方按 [[c1]] 验收后付款"},
+        {"id": "c3", "body": "争议解决见 [[c2]]"},
+        {"id": "c4", "body": "争议提交仲裁"},
+    ],
+}
+
+
+def _merge(doc, keep_id, drop_id, **extra):
+    return client.post(
+        "/api/merge",
+        json={**doc, "keep_id": keep_id, "drop_id": drop_id, **extra},
+    )
+
+
+def _record(doc, merged, keep_id, drop_id):
+    """按页面口径从合并前后草稿构造撤销记录（两条原文 + 改写来源前后正文）。"""
+    before = {c["id"]: c["body"] for c in doc["clauses"]}
+    after = {c["id"]: c["body"] for c in merged["clauses"]}
+    sources = [
+        {"id": cid, "body": before[cid], "after_body": after[cid]}
+        for cid in doc["order_ids"]
+        if cid not in (keep_id, drop_id) and f"[[{drop_id}]]" in before[cid]
+    ]
+    return {
+        "keep_id": keep_id,
+        "drop_id": drop_id,
+        "keep_body": before[keep_id],
+        "drop_body": before[drop_id],
+        "sources": sources,
+    }
+
+
+def _undo(doc, record, **extra):
+    return client.post(
+        "/api/merge/undo",
+        json={**doc, "record": record, **extra},
+    )
+
+
+def test_merge_undo_restores_origins_and_sources_in_current_order():
+    r = _merge(UNDO_DOC, "c1", "c2")
+    assert r.status_code == 200
+    merged = r.json()
+    rec = _record(UNDO_DOC, merged, "c1", "c2")
+
+    r = _undo(merged, rec)
+    assert r.status_code == 200, r.text
+    undone = r.json()
+    # 被移除身份插在保留条款之后；其他条款相对顺序不变
+    assert undone["order_ids"] == ["c1", "c2", "c3", "c4"]
+    assert {c["id"]: c["body"] for c in undone["clauses"]} == {
+        c["id"]: c["body"] for c in UNDO_DOC["clauses"]
+    }
+
+
+def test_merge_undo_inserts_drop_after_keep_current_position():
+    # 合并前当前顺序为 c4, c1, c2, c3：撤销时 c2 插在 c1 的当前位置之后
+    doc = {"order_ids": ["c4", "c1", "c2", "c3"], "clauses": UNDO_DOC["clauses"]}
+    r = _merge(doc, "c1", "c2")
+    assert r.status_code == 200
+    merged = r.json()
+    assert merged["order_ids"] == ["c4", "c1", "c3"]
+    rec = _record(doc, merged, "c1", "c2")
+
+    r = _undo(merged, rec)
+    assert r.status_code == 200
+    assert r.json()["order_ids"] == ["c4", "c1", "c2", "c3"]
+
+
+def test_merge_undo_keeps_unrelated_later_edits():
+    r = _merge(UNDO_DOC, "c1", "c2")
+    merged = r.json()
+    rec = _record(UNDO_DOC, merged, "c1", "c2")
+
+    # 合并之后校订与该次合并无关的 c4：撤销保留该校订
+    edited = {
+        "order_ids": merged["order_ids"],
+        "clauses": [
+            c if c["id"] != "c4" else {"id": "c4", "body": "仲裁地改为北京"}
+            for c in merged["clauses"]
+        ],
+    }
+    r = _undo(edited, rec)
+    assert r.status_code == 200
+    bodies = {c["id"]: c["body"] for c in r.json()["clauses"]}
+    assert bodies["c4"] == "仲裁地改为北京"
+    assert bodies["c2"] == "乙方按 [[c1]] 验收后付款"
+
+
+def test_merge_undo_conflicts_when_keep_or_source_body_drifted():
+    r = _merge(UNDO_DOC, "c1", "c2")
+    merged = r.json()
+    rec = _record(UNDO_DOC, merged, "c1", "c2")
+
+    # 保留条款合并后又被校订 -> 409 冲突
+    edited_keep = {
+        "order_ids": merged["order_ids"],
+        "clauses": [
+            c if c["id"] != "c1" else {"id": "c1", "body": "保留条款合并后的再校订"}
+            for c in merged["clauses"]
+        ],
+    }
+    r = _undo(edited_keep, rec)
+    assert r.status_code == 409
+    assert [x["id"] for x in r.json()["detail"]["conflicts"]] == ["c1"]
+
+    # 改写来源 c3 合并后又被校订 -> 409
+    edited_src = {
+        "order_ids": merged["order_ids"],
+        "clauses": [
+            c if c["id"] != "c3" else {"id": "c3", "body": "来源合并后的再校订 [[c1]]"}
+            for c in merged["clauses"]
+        ],
+    }
+    r = _undo(edited_src, rec)
+    assert r.status_code == 409
+    assert [x["id"] for x in r.json()["detail"]["conflicts"]] == ["c3"]
+    # 冲突时整次拒绝：草稿不变（撤销稿与入参不同；这里核验返回不含撤销结果）
+    assert "clauses" not in r.json()
+
+
+def test_merge_undo_conflicts_when_keep_missing_or_drop_reappeared_or_source_missing():
+    r = _merge(UNDO_DOC, "c1", "c2")
+    merged = r.json()
+    rec = _record(UNDO_DOC, merged, "c1", "c2")
+
+    # 保留身份已不在草稿（后续又删除了合并结果）-> 409
+    without_keep = {
+        "order_ids": ["c3", "c4"],
+        "clauses": [c for c in merged["clauses"] if c["id"] != "c1"],
+    }
+    r = _undo(without_keep, rec)
+    assert r.status_code == 409
+    assert [x["id"] for x in r.json()["detail"]["conflicts"]] == ["c1"]
+
+    # 被移除身份已重新出现（新的 c2）-> 409
+    reappeared = {
+        "order_ids": ["c1", "c2", "c3", "c4"],
+        "clauses": [
+            *merged["clauses"],
+            {"id": "c2", "body": "后来新建的 c2"},
+        ],
+    }
+    r = _undo(reappeared, rec)
+    assert r.status_code == 409
+    conflict_ids = [x["id"] for x in r.json()["detail"]["conflicts"]]
+    assert "c2" in conflict_ids
+
+    # 改写来源身份已不存在 -> 409
+    without_src = {
+        "order_ids": ["c1", "c4"],
+        "clauses": [c for c in merged["clauses"] if c["id"] != "c3"],
+    }
+    r = _undo(without_src, rec)
+    assert r.status_code == 409
+    assert [x["id"] for x in r.json()["detail"]["conflicts"]] == ["c3"]
+
+
+def test_merge_undo_rejects_damaged_record_422():
+    r = _merge(UNDO_DOC, "c1", "c2")
+    merged = r.json()
+    good = _record(UNDO_DOC, merged, "c1", "c2")
+
+    # 来源前后正文与合并改写不一致（记录损坏 / 篡改）-> 422
+    bad = {
+        **good,
+        "sources": [{"id": "c3", "body": good["sources"][0]["body"], "after_body": "篡改后的正文"}],
+    }
+    r = _undo(merged, bad)
+    assert r.status_code == 422
+
+    # 身份形态非法 / 保留与移除相同 / 来源重复或越界 -> 422
+    for bad in [
+        {**good, "keep_id": "x1"},
+        {**good, "drop_id": "c1"},
+        {**good, "sources": [*good["sources"], *good["sources"]]},
+        {**good, "sources": [{"id": "c1", "body": "甲", "after_body": "甲"}]},
+    ]:
+        r = _undo(merged, bad)
+        assert r.status_code == 422, r.text
+
+    # 来源正文形态损坏（未闭合标记）-> 422
+    bad = {
+        **good,
+        "sources": [{"id": "c3", "body": "坏 [[c2", "after_body": "坏 [[c1"}],
+    }
+    r = _undo(merged, bad)
+    assert r.status_code == 422
+
+
+def test_merge_undo_over_40_clauses_rejected_422():
+    # 当前 40 条，撤销会插回 1 条 -> 422
+    order = [f"c{i}" for i in range(1, 41)]
+    clauses = [{"id": cid, "body": f"正文{cid}"} for cid in order]
+    rec = {"keep_id": "c1", "drop_id": "c41", "keep_body": "正文c1", "drop_body": "正文c41", "sources": []}
+    r = client.post(
+        "/api/merge/undo",
+        json={"order_ids": order, "clauses": clauses, "record": rec},
+    )
+    assert r.status_code == 422
+    assert any("40" in e for e in r.json()["detail"]["errors"])
+
+    # 39 条 -> 撤销后 40 条，允许（记录须自洽且与草稿一致）
+    before = {
+        "order_ids": ["c1", "c41", *[f"c{i}" for i in range(2, 40)]],
+        "clauses": [
+            {"id": "c1", "body": "正文c1"},
+            {"id": "c41", "body": "正文c41"},
+            *[{"id": f"c{i}", "body": f"正文c{i}"} for i in range(2, 40)],
+        ],
+    }
+    r = _merge(before, "c1", "c41")
+    assert r.status_code == 200
+    merged39 = r.json()
+    assert len(merged39["order_ids"]) == 39
+    rec = _record(before, merged39, "c1", "c41")
+    r = _undo(merged39, rec)
+    assert r.status_code == 200
+    assert len(r.json()["order_ids"]) == 40
+
+
+def test_merge_undo_lock_protection_409():
+    r = _merge(UNDO_DOC, "c1", "c2")
+    merged = r.json()
+    rec = _record(UNDO_DOC, merged, "c1", "c2")
+
+    # 锁定改写来源 c3：撤销把其 [[c1]] 改回 [[c2]]（正文逐字变化）-> 409
+    r = _undo(merged, rec, lock_ids=["c3"])
+    assert r.status_code == 409
+    locked = r.json()["detail"]["locked"]
+    assert [v["id"] for v in locked] == ["c3"]
+    assert any("正文被改动" in reason for v in locked for reason in v["reasons"])
+
+    # 锁定保留条款 c1：撤销恢复其原文（正文逐字变化）-> 409
+    r = _undo(merged, rec, lock_ids=["c1"])
+    assert r.status_code == 409
+    assert [v["id"] for v in r.json()["detail"]["locked"]] == ["c1"]
+
+    # 锁定无关条款 c4：撤销不影响它 -> 允许
+    r = _undo(merged, rec, lock_ids=["c4"])
+    assert r.status_code == 200
+
+
+def test_merge_undo_lock_set_malformed_422():
+    r = _merge(UNDO_DOC, "c1", "c2")
+    merged = r.json()
+    rec = _record(UNDO_DOC, merged, "c1", "c2")
+    r = _undo(merged, rec, lock_ids=["c9"])
+    assert r.status_code == 422
+    r = _undo(merged, rec, lock_ids=["c3", "c3"])
+    assert r.status_code == 422
+    # 旧调用不传 lock_ids：按无锁定处理
+    r = _undo(merged, rec)
+    assert r.status_code == 200
+
+
+def test_merge_undo_restores_self_referential_drop_body():
+    # 被移除条款正文含自引用：合并时 [[c2]] 改指 [[c1]]，撤销须原样恢复 [[c2]]
+    doc = {
+        "order_ids": ["c1", "c2"],
+        "clauses": [
+            {"id": "c1", "body": "甲"},
+            {"id": "c2", "body": "见 [[c2]] 与 [[c1]]"},
+        ],
+    }
+    r = _merge(doc, "c1", "c2")
+    assert r.status_code == 200
+    merged = r.json()
+    assert {c["id"]: c["body"] for c in merged["clauses"]}["c1"] == "甲；见 [[c1]] 与 [[c1]]"
+    rec = _record(doc, merged, "c1", "c2")
+    r = _undo(merged, rec)
+    assert r.status_code == 200
+    undone = r.json()
+    assert undone["order_ids"] == ["c1", "c2"]
+    assert {c["id"]: c["body"] for c in undone["clauses"]}["c2"] == "见 [[c2]] 与 [[c1]]"
+
+
+def test_merge_undo_chain_reverse_order_restores_each_step():
+    # 连续两次合并（c1+c2，再 c1+c3），按成功合并的逆序逐条撤销
+    doc = {
+        "order_ids": ["c1", "c2", "c3"],
+        "clauses": [
+            {"id": "c1", "body": "甲"},
+            {"id": "c2", "body": "乙见 [[c1]]"},
+            {"id": "c3", "body": "丙见 [[c2]]"},
+        ],
+    }
+    r = _merge(doc, "c1", "c2")
+    first = r.json()
+    rec1 = _record(doc, first, "c1", "c2")
+    r = _merge(first, "c1", "c3")
+    second = r.json()
+    rec2 = _record(first, second, "c1", "c3")
+
+    # 先撤销第二次合并：回到第一次合并后的状态
+    r = _undo(second, rec2)
+    assert r.status_code == 200
+    back1 = r.json()
+    assert back1["order_ids"] == ["c1", "c3"]
+    assert {c["id"]: c["body"] for c in back1["clauses"]} == {
+        c["id"]: c["body"] for c in first["clauses"]
+    }
+    # 再撤销第一次合并：完整回到原稿
+    r = _undo(back1, rec1)
+    assert r.status_code == 200
+    back0 = r.json()
+    assert back0["order_ids"] == ["c1", "c2", "c3"]
+    assert {c["id"]: c["body"] for c in back0["clauses"]} == {
+        c["id"]: c["body"] for c in doc["clauses"]
+    }
+
+    # 跳过逆序、直接对第二次合并后的草稿撤销第一次记录：冲突拒绝（c1 正文已再变）
+    r = _undo(second, rec1)
+    assert r.status_code == 409
+
+
+def test_merge_undo_then_preview_and_export_match():
+    r = _merge(UNDO_DOC, "c1", "c2")
+    merged = r.json()
+    rec = _record(UNDO_DOC, merged, "c1", "c2")
+    r = _undo(merged, rec)
+    undone = r.json()
+
+    r = client.post("/api/preview", json=undone)
+    assert r.status_code == 200
+    assert [it["text"] for it in r.json()["items"]] == [
+        "甲方在七日内交付设备",
+        "乙方按 [[1]] 验收后付款",
+        "争议解决见 [[2]]",
+        "争议提交仲裁",
+    ]
+    r = client.post("/api/export", json=undone)
+    assert r.status_code == 200
+    assert r.json()["text"].split("\n") == [
+        "1|甲方在七日内交付设备",
+        "2|乙方按 [[1]] 验收后付款",
+        "3|争议解决见 [[2]]",
+        "4|争议提交仲裁",
+    ]
+
+
+def test_merge_undo_does_not_revive_broken_refs_and_keeps_other_bodies():
+    # 被移除条款自身正文带失效引用：撤销恢复后该失效引用仍失效，不复活
+    doc = {
+        "order_ids": ["c1", "c2", "c3"],
+        "clauses": [
+            {"id": "c1", "body": "甲"},
+            {"id": "c2", "body": "乙 [[c9]]"},
+            {"id": "c3", "body": "丙 [[c2]]"},
+        ],
+    }
+    r = _merge(doc, "c1", "c2")
+    merged = r.json()
+    rec = _record(doc, merged, "c1", "c2")
+    r = _undo(merged, rec)
+    assert r.status_code == 200
+    undone = r.json()
+    assert {c["id"]: c["body"] for c in undone["clauses"]}["c2"] == "乙 [[c9]]"
+    r = client.post("/api/preview", json=undone)
+    preview = r.json()
+    c2 = next(it for it in preview["items"] if it["id"] == "c2")
+    assert any(b["ref_id"] == "c9" for b in c2["broken"])
